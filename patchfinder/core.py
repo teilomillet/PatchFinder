@@ -46,7 +46,8 @@ class PatchFinder(ABC):
         patch_size: Union[int, float] = 256,
         overlap: float = 0.25,
         logger: Optional[logging.Logger] = None,
-        max_workers: int = 1
+        max_workers: int = 1,
+        aggregation_mode: str = "max"
     ):
         """Initialize base PatchFinder.
         
@@ -55,12 +56,15 @@ class PatchFinder(ABC):
             overlap: Patch overlap ratio (default: 0.25)
             logger: Custom logger (optional)
             max_workers: Parallel processing threads (default: 1)
+            aggregation_mode: How to aggregate patch confidences ('max', 'min', 'average')
         """
         self._validate_params(patch_size, overlap)
+        self._validate_aggregation_mode(aggregation_mode)
         self.patch_size = patch_size
         self.overlap = overlap
         self.max_workers = max_workers
         self.logger = logger or self._configure_default_logger()
+        self.aggregation_mode = aggregation_mode.lower()
 
     def _validate_params(self, patch_size, overlap):
         if isinstance(patch_size, float):
@@ -74,6 +78,16 @@ class PatchFinder(ABC):
         if not (0 <= overlap < 1):
             raise ValueError(f"Invalid overlap: {overlap}")
 
+    def _validate_aggregation_mode(self, mode: str):
+        """Validate the aggregation mode."""
+        valid_modes = {"max", "min", "average"}
+        mode = mode.lower()
+        if mode not in valid_modes:
+            raise ValueError(
+                f"Invalid aggregation_mode: {mode}. "
+                f"Valid options: {valid_modes}"
+            )
+
     def _configure_default_logger(self):
         logger = logging.getLogger(__name__)
         logger.addHandler(logging.NullHandler())
@@ -84,8 +98,21 @@ class PatchFinder(ABC):
         """Process a single patch and return text and confidence score."""
         pass
 
-    def extract(self, image_path: str, prompt: str = "Extract text", timeout: int = 30) -> Dict:
-        """Enhanced extraction with deadlock prevention."""
+    def extract(
+        self,
+        image_path: str,
+        prompt: str = "Extract text",
+        timeout: int = 30,
+        aggregation_mode: Optional[str] = None
+    ) -> Dict:
+        """Enhanced extraction with deadlock prevention and configurable confidence aggregation.
+        
+        Args:
+            image_path: Path to image file
+            prompt: Text prompt for extraction
+            timeout: Maximum time per patch in seconds
+            aggregation_mode: Override instance aggregation mode
+        """
         self.logger.info(f"Processing {image_path}")
         
         try:
@@ -106,7 +133,9 @@ class PatchFinder(ABC):
                     text, confidence = result
                     results.append((text, confidence))
 
-            return self._compile_results(results)
+            # Use override mode if provided, else instance mode
+            mode = aggregation_mode.lower() if aggregation_mode else self.aggregation_mode
+            return self._compile_results(results, mode)
         
         except Exception as e:
             self.logger.error(f"Processing failed: {str(e)}")
@@ -116,7 +145,8 @@ class PatchFinder(ABC):
                 "processed_patches": 0
             }
 
-    def _compile_results(self, results):
+    def _compile_results(self, results, mode: str):
+        """Compile results using specified aggregation mode."""
         if not results:
             return {
                 "text": "",
@@ -124,13 +154,28 @@ class PatchFinder(ABC):
                 "processed_patches": 0
             }
             
-        # Find text with highest confidence
         texts, confidences = zip(*results)
-        best_idx = np.argmax(confidences)
+        confidences = np.array(confidences)
+        
+        # Calculate aggregate confidence
+        if mode == "max":
+            best_idx = np.argmax(confidences)
+            confidence = confidences[best_idx]
+            selected_text = texts[best_idx]
+        elif mode == "min":
+            confidence = np.min(confidences)
+            # Still use highest confidence text
+            best_idx = np.argmax(confidences)
+            selected_text = texts[best_idx]
+        else:  # average
+            confidence = np.mean(confidences)
+            # Still use highest confidence text
+            best_idx = np.argmax(confidences)
+            selected_text = texts[best_idx]
         
         return {
-            "text": texts[best_idx],
-            "confidence": round(float(confidences[best_idx]), 4),
+            "text": selected_text,
+            "confidence": round(float(confidence), 4),
             "processed_patches": len(results)
         }
 

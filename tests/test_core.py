@@ -75,7 +75,68 @@ class TestMLXPatchFinder(unittest.TestCase):
         finder = MLXPatchFinder(self.model, self.processor)
         self.assertEqual(finder.patch_size, 256)
         self.assertEqual(finder.overlap, 0.25)
+        self.assertEqual(finder.aggregation_mode, "max")  # Test default mode
         
+        # Test custom mode
+        finder = MLXPatchFinder(self.model, self.processor, aggregation_mode="average")
+        self.assertEqual(finder.aggregation_mode, "average")
+        
+        # Test invalid mode
+        with self.assertRaises(ValueError):
+            MLXPatchFinder(self.model, self.processor, aggregation_mode="invalid")
+            
+    def test_aggregation_modes(self):
+        """Test different confidence aggregation modes"""
+        finder = MLXPatchFinder(self.model, self.processor)
+        
+        # Mock patches and processing
+        patches = [
+            Image.new('RGB', (256, 256), color='white'),
+            Image.new('RGB', (256, 256), color='black'),
+            Image.new('RGB', (256, 256), color='gray')
+        ]
+        
+        # Mock processor
+        self.processor.return_value = {
+            "input_ids": np.array([[1, 2, 3]])
+        }
+        
+        # Mock different confidences for patches
+        confidences = [0.6, 0.9, 0.3]
+        texts = ["medium conf", "high conf", "low conf"]
+        
+        def mock_generate_step(*args, **kwargs):
+            for conf in confidences:
+                yield 5, np.array([conf, 1 - conf])
+        
+        self.model.generate_step.side_effect = mock_generate_step
+        
+        # Mock tokenizer with different texts
+        text_iter = iter(texts)
+        self.processor.tokenizer.detokenizer.text = lambda: next(text_iter)
+        
+        with patch('patchfinder.core.generate_patches', return_value=patches):
+            # Test max mode (default)
+            result = finder.extract(self.test_image)
+            self.assertEqual(result["text"], "high conf")
+            self.assertAlmostEqual(result["confidence"], 0.9, places=4)
+            
+            # Test min mode
+            result = finder.extract(self.test_image, aggregation_mode="min")
+            self.assertEqual(result["text"], "high conf")  # Still highest conf text
+            self.assertAlmostEqual(result["confidence"], 0.3, places=4)
+            
+            # Test average mode
+            result = finder.extract(self.test_image, aggregation_mode="average")
+            self.assertEqual(result["text"], "high conf")  # Still highest conf text
+            self.assertAlmostEqual(result["confidence"], 0.6, places=4)
+            
+            # Test override at extract time
+            finder = MLXPatchFinder(self.model, self.processor, aggregation_mode="min")
+            result = finder.extract(self.test_image, aggregation_mode="max")
+            self.assertEqual(result["text"], "high conf")
+            self.assertAlmostEqual(result["confidence"], 0.9, places=4)
+            
     @patch('patchfinder.core.generate_patches')
     def test_extract_basic(self, mock_generate_patches):
         """Test basic extraction with MLX"""

@@ -96,7 +96,32 @@ finder = PatchFinder.wrap(
 )
 ```
 
-### 2. Custom Prompting
+### 2. Confidence Aggregation
+
+Configure how patch confidences are aggregated:
+
+```python
+# Global configuration
+finder = PatchFinder.wrap(
+    model, 
+    processor,
+    aggregation_mode="min"  # 'max', 'min', or 'average'
+)
+
+# Per-call override
+result = finder.extract(
+    "doc.jpg",
+    aggregation_mode="average"  # Overrides global setting
+)
+```
+
+| Mode | Behavior | Use Case |
+|------|----------|----------|
+| `max` | Highest patch confidence (default) | General-purpose quality assessment |
+| `min` | Lowest patch confidence | Critical applications requiring high certainty |
+| `average` | Mean of patch confidences | Balanced assessment across document |
+
+### 3. Custom Prompting
 
 ```python
 result = finder.extract(
@@ -106,7 +131,7 @@ result = finder.extract(
 )
 ```
 
-### 3. Logging Configuration
+### 4. Logging Configuration
 
 ```python
 import logging
@@ -117,20 +142,12 @@ logger.setLevel(logging.DEBUG)
 finder = PatchFinder.wrap(model, processor, logger=logger)
 ```
 
-## Performance Comparison
-
-| Backend      | DocVQA Accuracy | Speed (tok/s) | Memory | Device Support |
-|--------------|-----------------|---------------|--------|----------------|
-| MLX          | 81.5%          | 22           | 8GB    | Apple Silicon  |
-| vLLM         | 94.0%          | 45           | 24GB   | NVIDIA GPUs    |
-| Transformers | 93.8%          | 28           | 16GB   | Universal      |
-
 ## How It Works
 
 1. **Document Splitting**: Images are split into overlapping patches
 2. **Parallel Processing**: Each patch is processed independently
 3. **Confidence Scoring**: Model uncertainty is used to score each patch
-4. **Result Selection**: Text from highest-confidence patch is returned
+4. **Result Selection**: Text from highest-confidence patch is returned, with configurable confidence aggregation
 
 ## Contributing
 
