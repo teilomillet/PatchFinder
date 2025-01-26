@@ -1,10 +1,11 @@
 # core.py
 from abc import ABC, abstractmethod
 import logging
-from typing import Optional, Dict, Union, Any
+from typing import Optional, Dict, Union, Any, Tuple
 from .patch_generator import generate_patches
 from .confidence import calculate_patch_confidence
 import torch
+import numpy as np
 
 class PatchFinder(ABC):
     """Base class for PatchFinder implementations supporting multiple backends."""
@@ -28,6 +29,14 @@ class PatchFinder(ABC):
                 return VLLMPatchFinder(model, **kwargs)
         except ImportError:
             pass
+            
+        # Check for MLX model
+        if "mlx" in str(type(model)):
+            try:
+                import mlx.core as mx
+                return MLXPatchFinder(model, processor, **kwargs)
+            except ImportError:
+                raise ImportError("MLX backend detected but mlx package not installed. Please install mlx-lm.")
             
         # Default to Transformers implementation
         return TransformersPatchFinder(model, processor, **kwargs)
@@ -71,8 +80,8 @@ class PatchFinder(ABC):
         return logger
 
     @abstractmethod
-    def _process_patch(self, patch, prompt: str, timeout: int, idx: int) -> Optional[float]:
-        """Process a single patch and return confidence score."""
+    def _process_patch(self, patch, prompt: str, timeout: int, idx: int) -> Optional[Tuple[str, float]]:
+        """Process a single patch and return text and confidence score."""
         pass
 
     def extract(self, image_path: str, prompt: str = "Extract text", timeout: int = 30) -> Dict:
@@ -90,13 +99,14 @@ class PatchFinder(ABC):
                     "processed_patches": 0
                 }
 
-            confidences = []
+            results = []
             for idx, patch in enumerate(patches):
-                confidence = self._process_patch(patch, prompt, timeout, idx)
-                if confidence is not None:
-                    confidences.append(confidence)
+                result = self._process_patch(patch, prompt, timeout, idx)
+                if result is not None:
+                    text, confidence = result
+                    results.append((text, confidence))
 
-            return self._compile_results(confidences)
+            return self._compile_results(results)
         
         except Exception as e:
             self.logger.error(f"Processing failed: {str(e)}")
@@ -106,13 +116,114 @@ class PatchFinder(ABC):
                 "processed_patches": 0
             }
 
-    def _compile_results(self, confidences):
-        avg_conf = sum(confidences)/len(confidences) if confidences else 0.0
+    def _compile_results(self, results):
+        if not results:
+            return {
+                "text": "",
+                "confidence": 0.0,
+                "processed_patches": 0
+            }
+            
+        # Find text with highest confidence
+        texts, confidences = zip(*results)
+        best_idx = np.argmax(confidences)
+        
         return {
-            "text": "",
-            "confidence": round(avg_conf, 4),
-            "processed_patches": len(confidences)
+            "text": texts[best_idx],
+            "confidence": round(float(confidences[best_idx]), 4),
+            "processed_patches": len(results)
         }
+
+class MLXPatchFinder(PatchFinder):
+    """PatchFinder implementation for MLX models."""
+    
+    def __init__(
+        self,
+        model,
+        processor,
+        patch_size: Union[int, float] = 256,
+        overlap: float = 0.25,
+        logger: Optional[logging.Logger] = None,
+        max_workers: int = 1
+    ):
+        super().__init__(patch_size, overlap, logger, max_workers)
+        self.model = model
+        self.processor = processor
+        
+    def _mlx_generate_with_logprobs(self, prompt_tokens, patch, max_tokens=500):
+        """Generate text and compute logprobs using MLX's generate_step."""
+        import mlx.core as mx
+        
+        self.logger.debug("Starting MLX generation")
+        detokenizer = self.processor.tokenizer.detokenizer
+        detokenizer.reset()
+        all_logprobs = []
+        
+        try:
+            for (token, logprobs), _ in zip(
+                self.model.generate_step(prompt_tokens, temperature=0.0),
+                range(max_tokens)
+            ):
+                if token == self.processor.tokenizer.eos_token_id:
+                    break
+                    
+                detokenizer.add_token(token)
+                all_logprobs.append(logprobs)
+                
+            text = detokenizer.text
+            logprobs_array = np.array([lp.tolist() for lp in all_logprobs])
+            
+            return text, logprobs_array
+            
+        except Exception as e:
+            self.logger.error(f"MLX generation failed: {str(e)}", exc_info=True)
+            return None, None
+
+    def _process_patch(self, patch, prompt: str, timeout: int, idx: int) -> Optional[Tuple[str, float]]:
+        try:
+            self.logger.debug(f"Processing patch {idx} | Size: {patch.size} | Mode: {patch.mode}")
+            
+            # Format prompt
+            messages = [{
+                "role": "user",
+                "content": f"<image>\n{prompt}"
+            }]
+            
+            formatted_prompt = self.processor.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            
+            # Convert patch if needed
+            if patch.mode != 'RGB':
+                patch = patch.convert('RGB')
+                
+            # Process inputs
+            inputs = self.processor(
+                text=formatted_prompt,
+                images=[patch],
+                return_tensors="np"
+            )
+            
+            # Generate with logprobs
+            text, logprobs = self._mlx_generate_with_logprobs(
+                inputs["input_ids"][0],
+                patch
+            )
+            
+            if text is None or logprobs is None:
+                return None
+                
+            # Calculate confidence
+            confidence = calculate_patch_confidence(logprobs)
+            return text, confidence
+            
+        except Exception as e:
+            self.logger.error(f"Patch {idx} failed: {str(e)}", exc_info=True)
+            return None
+
+# Update existing implementations to match new interface
 
 class TransformersPatchFinder(PatchFinder):
     """PatchFinder implementation for Hugging Face Transformers models."""
@@ -136,7 +247,7 @@ class TransformersPatchFinder(PatchFinder):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    def _process_patch(self, patch, prompt: str, timeout: int, idx: int) -> Optional[float]:
+    def _process_patch(self, patch, prompt: str, timeout: int, idx: int) -> Optional[Tuple[str, float]]:
         try:
             self.logger.debug(f"Processing patch {idx} | Size: {patch.size} | Mode: {patch.mode}")
             
@@ -178,8 +289,15 @@ class TransformersPatchFinder(PatchFinder):
                     return_dict_in_generate=True
                 )
 
+            # Get generated text
+            generated_ids = generate_ids.sequences[0, inputs["input_ids"].shape[1]:]
+            text = self.processor.decode(generated_ids, skip_special_tokens=True)
+            
+            # Calculate confidence
             logits = torch.stack(generate_ids.scores, dim=1).cpu().numpy()
-            return calculate_patch_confidence(logits)
+            confidence = calculate_patch_confidence(logits)
+            
+            return text, confidence
             
         except Exception as e:
             self.logger.error(f"Patch {idx} failed: {str(e)}", exc_info=True)
@@ -205,17 +323,19 @@ class VLLMPatchFinder(PatchFinder):
         if not getattr(llm.sampling_params, "output_logprobs", True):
             raise ValueError("vLLM output_logprobs must be enabled")
 
-    def _process_patch(self, patch, prompt: str, timeout: int, idx: int) -> Optional[float]:
+    def _process_patch(self, patch, prompt: str, timeout: int, idx: int) -> Optional[Tuple[str, float]]:
         try:
             self.logger.debug(f"Processing patch {idx} | Size: {patch.size} | Mode: {patch.mode}")
             
             # vLLM specific processing here
-            # This is a placeholder - actual implementation would depend on vLLM's API
             outputs = self.llm.generate(prompt, images=[patch])
             
-            # Extract logprobs from vLLM output
+            # Extract text and logprobs
+            text = outputs[0].outputs[0].text
             logprobs = outputs[0].outputs[0].logprobs
-            return calculate_patch_confidence(logprobs)
+            confidence = calculate_patch_confidence(logprobs)
+            
+            return text, confidence
             
         except Exception as e:
             self.logger.error(f"Patch {idx} failed: {str(e)}", exc_info=True)

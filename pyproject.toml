@@ -16,6 +16,20 @@ dependencies = [
     "fire>=0.5.0"
 ]
 
+[project.optional-dependencies]
+mlx = [
+    "mlx>=0.5.0",
+    "mlx-lm>=0.5.0"
+]
+vllm = [
+    "vllm>=0.3.0"
+]
+all = [
+    "mlx>=0.5.0",
+    "mlx-lm>=0.5.0",
+    "vllm>=0.3.0"
+]
+
 [project.scripts]
 patchfinder = "patchfinder.cli:main"
 
