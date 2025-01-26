@@ -6,12 +6,13 @@ PatchFinder is a Python library for accurate document text extraction using Visi
 
 ## Features
 
-- Efficient patch-based document processing
-- Support for custom VLM models and prompts
-- Confidence-based result aggregation
-- GPU acceleration support
-- Batch processing capabilities
-- Comprehensive CLI interface
+- **Lightweight Integration**: 3-line integration with existing VLM code
+- **Multiple Backend Support**: Works with Transformers and vLLM
+- **Zero Configuration**: Automatic backend detection and setup
+- **Patch-based Processing**: Efficient document handling with overlapping patches
+- **Confidence Scoring**: Built-in uncertainty estimation
+- **GPU Acceleration**: Automatic device management
+- **Type Safety**: Full type hints and runtime checks
 
 ## Installation
 
@@ -21,142 +22,91 @@ pip install patchfinder
 
 ## Quick Start
 
-Process a single document:
+### 1. Transformers Backend (3-Line Integration)
 
 ```python
-from patchfinder import PatchFinder
 from transformers import AutoProcessor, AutoModelForCausalLM
+from patchfinder import PatchFinder  # 1. Import
 
-# Initialize model and processor
+# Your existing model initialization
 model_name = "microsoft/phi-3-vision-128k-instruct"
-processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+processor = AutoProcessor.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name)
 
-# Create PatchFinder instance
-finder = PatchFinder(model=model, processor=processor)
+finder = PatchFinder.wrap(model, processor)  # 2. Wrap
 
-# Process image
-result = finder.extract(
-    image_path="document.jpg",
-    prompt="Extract all text from this document"
-)
-
-print(f"Extracted text: {result['text']}")
+# Process document
+result = finder.extract("document.jpg", "Extract all text")  # 3. Use
 print(f"Confidence: {result['confidence']}")
 ```
 
-## Integration with Existing Models
-
-If you're already using transformers or other vision models, PatchFinder can be easily integrated:
+### 2. vLLM Backend (3-Line Integration)
 
 ```python
-import torch
-from transformers import AutoProcessor, AutoModelForCausalLM
-from patchfinder import PatchFinder
+from vllm import LLM
+from patchfinder import PatchFinder  # 1. Import
 
-class DocumentProcessor:
-    def __init__(self, model_name="microsoft/phi-3-vision-128k-instruct"):
-        # Initialize your existing model pipeline
-        self.processor = AutoProcessor.from_pretrained(
-            model_name, 
-            trust_remote_code=True
-        )
-        
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            torch_dtype=torch.float16,
-            device_map="auto" if torch.cuda.is_available() else None
-        )
-        
-        # Add PatchFinder on top
-        self.patchfinder = PatchFinder(
-            model=self.model,
-            processor=self.processor,
-            patch_size=256,
-            overlap=0.25
-        )
-    
-    def process_document(self, image_path: str, custom_prompt: str = None) -> dict:
-        # Use your existing preprocessing if needed
-        prompt = custom_prompt or "Extract all text from this document"
-        
-        # Let PatchFinder handle the patch-based processing
-        result = self.patchfinder.extract(
-            image_path=image_path,
-            prompt=prompt,
-            timeout=30
-        )
-        
-        # Post-process or format results as needed
-        return {
-            "text": result["text"],
-            "confidence": result["confidence"],
-            "processed_patches": result["processed_patches"]
-        }
-
-# Usage example
-processor = DocumentProcessor()
-result = processor.process_document(
-    "document.jpg",
-    custom_prompt="Extract and structure all text from this document"
+# Your existing vLLM setup
+llm = LLM(
+    model="microsoft/phi-3-vision-128k-instruct",
+    trust_remote_code=True,
+    dtype="float16",
+    gpu_memory_utilization=0.7
 )
+
+finder = PatchFinder.wrap(llm)  # 2. Wrap
+
+# Process document
+result = finder.extract("document.jpg", "Extract all text")  # 3. Use
+print(f"Confidence: {result['confidence']}")
 ```
-
-## Command Line Interface
-
-PatchFinder provides a powerful CLI for both single-file and batch processing:
-
-Process a single image:
-```bash
-python -m patchfinder.cli process image.jpg --prompt="Extract text" --verbose
-```
-
-Process all images in a directory:
-```bash
-python -m patchfinder.cli batch_process ./images/ --output_file=results.json
-```
-
-CLI Options:
-- `model_name`: Vision language model to use (default: microsoft/phi-3-vision-128k-instruct)
-- `patch_size`: Size of image patches (default: 256)
-- `overlap`: Overlap ratio between patches (default: 0.25)
-- `device`: Processing device (default: auto-detect GPU/CPU)
-- `timeout`: Processing timeout in seconds (default: 30)
-- `verbose`: Enable detailed logging
 
 ## Advanced Usage
 
-Custom model configuration:
+### 1. Custom Patch Configuration
+
 ```python
-finder = PatchFinder(
-    model=model,
-    processor=processor,
+finder = PatchFinder.wrap(
+    model, 
+    processor,
     patch_size=512,  # Larger patches
-    overlap=0.5,     # More overlap
-    max_workers=2    # Parallel processing
+    overlap=0.5      # More overlap
 )
 ```
 
-Batch processing with custom settings:
-```python
-from pathlib import Path
+### 2. Custom Prompting
 
-image_dir = Path("./documents")
-for image_path in image_dir.glob("*.jpg"):
-    result = finder.extract(
-        image_path=str(image_path),
-        prompt="Extract and format all text",
-        timeout=60
-    )
-    print(f"Processed {image_path.name}: {result['confidence']:.2f} confidence")
+```python
+result = finder.extract(
+    "invoice.pdf",
+    prompt="Extract the total amount and date from this invoice",
+    timeout=60  # Longer timeout for complex documents
+)
 ```
+
+### 3. Logging Configuration
+
+```python
+import logging
+
+logger = logging.getLogger("patchfinder")
+logger.setLevel(logging.DEBUG)
+
+finder = PatchFinder.wrap(model, processor, logger=logger)
+```
+
+## How It Works
+
+1. **Document Splitting**: Images are split into overlapping patches
+2. **Parallel Processing**: Each patch is processed independently
+3. **Confidence Scoring**: Model uncertainty is used to score each patch
+4. **Result Aggregation**: High-confidence results are prioritized
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please check out our [Contributing Guide](CONTRIBUTING.md) for guidelines.
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
