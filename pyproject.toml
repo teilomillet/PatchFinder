@@ -1,6 +1,6 @@
 [project]
 name = "patchfinder"
-version = "0.1.0"
+version = "0.2.0"
 description = "Plug-and-play document readability and extraction toolkit for VLMs."
 authors = [{ name = "teilomillet", email = "teilomillet@gmail.com" }]
 readme = "README.md"

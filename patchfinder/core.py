@@ -28,7 +28,7 @@ class PatchFinder:
         self,
         model,
         processor,
-        patch_size: int = 256,
+        patch_size: int | float = 0.25,
         overlap: float = 0.25,
         logger: Optional[logging.Logger] = None,
         max_workers: int = 1
@@ -43,8 +43,14 @@ class PatchFinder:
         self._configure_torch()
 
     def _validate_params(self, patch_size, overlap):
-        if patch_size <= 0:
-            raise ValueError(f"Invalid patch_size: {patch_size}")
+        if isinstance(patch_size, float):
+            if not (0 < patch_size <= 1):
+                raise ValueError(f"Invalid patch_size %: {patch_size}")
+        elif isinstance(patch_size, int):
+            if patch_size <= 0:
+                raise ValueError(f"Invalid patch_size: {patch_size}")
+        else:
+            raise TypeError("patch_size must be int or float")
         if not (0 <= overlap < 1):
             raise ValueError(f"Invalid overlap: {overlap}")
 

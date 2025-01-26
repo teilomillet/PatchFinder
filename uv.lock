@@ -437,7 +437,7 @@ wheels = [
 
 [[package]]
 name = "patchfinder"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fire" },
@@ -452,7 +452,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fire", specifier = ">=0.7.0" },
+    { name = "fire", specifier = ">=0.5.0" },
     { name = "numpy", specifier = ">=2.2.2" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pytest", specifier = ">=7.0.0" },
