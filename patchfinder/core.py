@@ -186,6 +186,7 @@ class MLXPatchFinder(PatchFinder):
         self,
         model,
         processor,
+        model_path: Optional[str] = None,
         patch_size: Union[int, float] = 256,
         overlap: float = 0.25,
         logger: Optional[logging.Logger] = None,
@@ -194,66 +195,163 @@ class MLXPatchFinder(PatchFinder):
         super().__init__(patch_size, overlap, logger, max_workers)
         self.model = model
         self.processor = processor
+        self.model_path = model_path
         
     def _mlx_generate_with_logprobs(self, prompt_tokens, patch, max_tokens=500):
-        """Generate text and compute logprobs using MLX's generate_step."""
+        """Generate text and compute logprobs using MLX-VLM's generate_step function."""
         import mlx.core as mx
+        from mlx_vlm.utils import prepare_inputs, generate_step
         
         self.logger.debug("Starting MLX generation")
-        detokenizer = self.processor.tokenizer.detokenizer
-        detokenizer.reset()
-        all_logprobs = []
         
         try:
-            for (token, logprobs), _ in zip(
-                self.model.generate_step(prompt_tokens, temperature=0.0),
-                range(max_tokens)
+            # Prepare inputs for generation
+            image_token_index = getattr(self.model.config, "image_token_index", None)
+            inputs = prepare_inputs(
+                self.processor,
+                patch,
+                prompt_tokens,
+                image_token_index
+            )
+            
+            # Initialize empty lists for text and logprobs
+            generated_text = []
+            all_logprobs = []
+            max_vocab_size = 0  # Track maximum vocabulary size
+            
+            # Get eos_token_id from processor or its tokenizer
+            eos_token_id = getattr(self.processor, "eos_token_id", None)
+            if eos_token_id is None:
+                eos_token_id = getattr(self.processor.tokenizer, "eos_token_id", None)
+            if eos_token_id is None:
+                self.logger.warning("No eos_token_id found in processor or tokenizer")
+                eos_token_id = 2  # Common default, but may need adjustment
+            
+            # Generate tokens and collect logprobs
+            for token, logprobs in generate_step(
+                inputs["input_ids"],
+                self.model,
+                inputs["pixel_values"],
+                inputs.get("attention_mask"),
+                max_tokens=max_tokens,
+                temp=0.0  # No randomness for confidence calculation
             ):
-                if token == self.processor.tokenizer.eos_token_id:
-                    break
-                    
-                detokenizer.add_token(token)
+                # Convert token to text
+                token_text = self.processor.decode([token])
+                generated_text.append(token_text)
+                
+                # Handle different log probability dimensions
+                # MLX models can return logprobs in different formats:
+                # 1. 2D array (batch_size, vocab_size): Full attention matrix
+                # 2. 1D array (vocab_size,): Direct token probabilities
+                # 3. 0D scalar: Single probability value
+                #
+                # We need to standardize these to 1D arrays for consistent processing
+                if logprobs.ndim > 1:
+                    # For 2D arrays, we take the last row which represents
+                    # the most recent token's probabilities across the vocabulary.
+                    # This is because earlier rows might contain attention context
+                    # that we don't need for confidence calculation.
+                    logprobs = logprobs[-1]
+                elif logprobs.ndim == 0:
+                    # For scalar values, wrap in 1D array to maintain consistency
+                    # This is rare but can happen with certain model configurations
+                    logprobs = np.array([logprobs])
+                
+                # Track the maximum vocabulary size we've seen
+                # This is crucial because different tokens might have different
+                # vocabulary sizes due to model architecture or dynamic vocabulary
+                max_vocab_size = max(max_vocab_size, len(logprobs))
+                
+                # Store the standardized 1D logprobs
                 all_logprobs.append(logprobs)
                 
-            text = detokenizer.text
-            logprobs_array = np.array([lp.tolist() for lp in all_logprobs])
+                # Stop if we hit the end token
+                if token == eos_token_id:
+                    break
             
-            return text, logprobs_array
+            # Combine text from all generated tokens
+            text = "".join(generated_text)
+            
+            # Handle padding and truncation of log probabilities
+            # This is necessary because:
+            # 1. Different tokens might have different vocabulary sizes
+            # 2. We need consistent shapes for numpy.stack
+            # 3. We want to preserve probability mass distribution
+            if all_logprobs:
+                padded_logprobs = []
+                for logprob in all_logprobs:
+                    if len(logprob) < max_vocab_size:
+                        # If this token's logprobs are shorter than our maximum:
+                        # 1. Create padding array of very negative values (-1e10)
+                        # 2. When converted to probabilities, these will be effectively zero
+                        # 3. This preserves the probability mass of the original distribution
+                        padding = np.full(max_vocab_size - len(logprob), -1e10)
+                        padded_logprobs.append(np.concatenate([logprob, padding]))
+                    else:
+                        # If this token's logprobs are longer:
+                        # 1. Truncate to maximum size
+                        # 2. This might lose some probability mass
+                        # 3. But these are typically very low probability tokens
+                        padded_logprobs.append(logprob[:max_vocab_size])
+                
+                # Stack all padded logprobs into a single 2D array
+                # Shape: (num_tokens, max_vocab_size)
+                logprobs = np.stack(padded_logprobs)
+                self.logger.debug(f"Generated logprobs shape after padding: {logprobs.shape}")
+            else:
+                self.logger.warning("No logprobs generated")
+                return None, None
+            
+            return text, logprobs
             
         except Exception as e:
             self.logger.error(f"MLX generation failed: {str(e)}", exc_info=True)
             return None, None
-
+            
     def _process_patch(self, patch, prompt: str, timeout: int, idx: int) -> Optional[Tuple[str, float]]:
         try:
             self.logger.debug(f"Processing patch {idx} | Size: {patch.size} | Mode: {patch.mode}")
             
-            # Format prompt
-            messages = [{
-                "role": "user",
-                "content": f"<image>\n{prompt}"
-            }]
-            
-            formatted_prompt = self.processor.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True
-            )
+            # Import MLX-VLM's template utility
+            try:
+                from mlx_vlm.prompt_utils import apply_chat_template
+                from mlx_vlm.utils import load_config
+                
+                # Get config for template application
+                if self.model_path:
+                    config = load_config(self.model_path)
+                else:
+                    # Fallback to basic template if no model path
+                    raise ImportError("No model_path provided for config loading")
+                
+                # Format prompt using MLX-VLM's template
+                formatted_prompt = apply_chat_template(
+                    self.processor,
+                    config,
+                    prompt,
+                    num_images=1
+                )
+            except ImportError as e:
+                # Fallback to basic template if MLX-VLM utils not available
+                self.logger.warning(f"MLX-VLM prompt utils not available: {str(e)}")
+                messages = [{
+                    "role": "user",
+                    "content": prompt
+                }]
+                formatted_prompt = self.processor.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True
+                )
             
             # Convert patch if needed
             if patch.mode != 'RGB':
                 patch = patch.convert('RGB')
-                
-            # Process inputs
-            inputs = self.processor(
-                text=formatted_prompt,
-                images=[patch],
-                return_tensors="np"
-            )
             
             # Generate with logprobs
             text, logprobs = self._mlx_generate_with_logprobs(
-                inputs["input_ids"][0],
+                formatted_prompt,
                 patch
             )
             
