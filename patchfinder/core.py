@@ -6,6 +6,8 @@ from .patch_generator import generate_patches
 from .confidence import calculate_patch_confidence
 import torch
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
 
 class PatchFinder(ABC):
     """Base class for PatchFinder implementations supporting multiple backends."""
@@ -103,15 +105,17 @@ class PatchFinder(ABC):
         image_path: str,
         prompt: str = "Extract text",
         timeout: int = 30,
-        aggregation_mode: Optional[str] = None
+        aggregation_mode: Optional[str] = None,
+        max_workers: Optional[int] = None  # Number of parallel workers
     ) -> Dict:
-        """Enhanced extraction with deadlock prevention and configurable confidence aggregation.
+        """Enhanced extraction with parallel processing and configurable confidence aggregation.
         
         Args:
             image_path: Path to image file
             prompt: Text prompt for extraction
             timeout: Maximum time per patch in seconds
             aggregation_mode: Override instance aggregation mode
+            max_workers: Maximum number of parallel workers (defaults to number of CPU cores)
         """
         self.logger.info(f"Processing {image_path}")
         
@@ -126,12 +130,29 @@ class PatchFinder(ABC):
                     "processed_patches": 0
                 }
 
+            # Default to number of CPU cores if max_workers not specified
+            if max_workers is None:
+                max_workers = multiprocessing.cpu_count()
+
             results = []
-            for idx, patch in enumerate(patches):
-                result = self._process_patch(patch, prompt, timeout, idx)
-                if result is not None:
-                    text, confidence = result
-                    results.append((text, confidence))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Submit all patch processing tasks
+                future_to_patch = {
+                    executor.submit(self._process_patch, patch, prompt, timeout, idx): idx
+                    for idx, patch in enumerate(patches)
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_patch):
+                    idx = future_to_patch[future]
+                    try:
+                        result = future.result()
+                        if result is not None:
+                            text, confidence = result
+                            results.append((text, confidence))
+                            self.logger.debug(f"Patch {idx} completed with confidence {confidence:.4f}")
+                    except Exception as e:
+                        self.logger.error(f"Patch {idx} failed: {str(e)}")
 
             # Use override mode if provided, else instance mode
             mode = aggregation_mode.lower() if aggregation_mode else self.aggregation_mode
@@ -197,6 +218,21 @@ class MLXPatchFinder(PatchFinder):
         self.processor = processor
         self.model_path = model_path
         
+        # Load config once during initialization
+        try:
+            from mlx_vlm.prompt_utils import apply_chat_template
+            from mlx_vlm.utils import load_config
+            
+            if self.model_path:
+                self.config = load_config(self.model_path)
+                self.logger.debug("Successfully loaded MLX-VLM config")
+            else:
+                self.config = None
+                self.logger.warning("No model_path provided for config loading")
+        except ImportError as e:
+            self.logger.warning(f"MLX-VLM utils not available: {str(e)}")
+            self.config = None
+            
     def _mlx_generate_with_logprobs(self, prompt_tokens, patch, max_tokens=500):
         """Generate text and compute logprobs using MLX-VLM's generate_step function."""
         import mlx.core as mx
@@ -313,28 +349,24 @@ class MLXPatchFinder(PatchFinder):
         try:
             self.logger.debug(f"Processing patch {idx} | Size: {patch.size} | Mode: {patch.mode}")
             
-            # Import MLX-VLM's template utility
+            # Format prompt using pre-loaded config
             try:
                 from mlx_vlm.prompt_utils import apply_chat_template
-                from mlx_vlm.utils import load_config
                 
-                # Get config for template application
-                if self.model_path:
-                    config = load_config(self.model_path)
+                if self.config is not None:
+                    # Use pre-loaded config
+                    formatted_prompt = apply_chat_template(
+                        self.processor,
+                        self.config,
+                        prompt,
+                        num_images=1
+                    )
                 else:
-                    # Fallback to basic template if no model path
-                    raise ImportError("No model_path provided for config loading")
-                
-                # Format prompt using MLX-VLM's template
-                formatted_prompt = apply_chat_template(
-                    self.processor,
-                    config,
-                    prompt,
-                    num_images=1
-                )
+                    raise ImportError("No config available")
+                    
             except ImportError as e:
-                # Fallback to basic template if MLX-VLM utils not available
-                self.logger.warning(f"MLX-VLM prompt utils not available: {str(e)}")
+                # Fallback to basic template
+                self.logger.warning(f"Using basic template: {str(e)}")
                 messages = [{
                     "role": "user",
                     "content": prompt
