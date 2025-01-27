@@ -237,6 +237,7 @@ class MLXPatchFinder(PatchFinder):
         """Generate text and compute logprobs using MLX-VLM's generate_step function."""
         import mlx.core as mx
         from mlx_vlm.utils import prepare_inputs, generate_step
+        import numpy as np
         
         self.logger.debug("Starting MLX generation")
         
@@ -250,10 +251,9 @@ class MLXPatchFinder(PatchFinder):
                 image_token_index
             )
             
-            # Initialize empty lists for text and logprobs
+            # Initialize lists for text and logprobs
             generated_text = []
-            all_logprobs = []
-            max_vocab_size = 0  # Track maximum vocabulary size
+            token_logprobs = []  # Store only the logprob of selected token
             
             # Get eos_token_id from processor or its tokenizer
             eos_token_id = getattr(self.processor, "eos_token_id", None)
@@ -270,37 +270,34 @@ class MLXPatchFinder(PatchFinder):
                 inputs["pixel_values"],
                 inputs.get("attention_mask"),
                 max_tokens=max_tokens,
-                temp=0.0  # No randomness for confidence calculation
+                temp=0.0  # Greedy decoding
             ):
                 # Convert token to text
                 token_text = self.processor.decode([token])
                 generated_text.append(token_text)
                 
-                # Handle different log probability dimensions
-                # MLX models can return logprobs in different formats:
-                # 1. 2D array (batch_size, vocab_size): Full attention matrix
-                # 2. 1D array (vocab_size,): Direct token probabilities
-                # 3. 0D scalar: Single probability value
-                #
-                # We need to standardize these to 1D arrays for consistent processing
-                if logprobs.ndim > 1:
-                    # For 2D arrays, we take the last row which represents
-                    # the most recent token's probabilities across the vocabulary.
-                    # This is because earlier rows might contain attention context
-                    # that we don't need for confidence calculation.
-                    logprobs = logprobs[-1]
-                elif logprobs.ndim == 0:
-                    # For scalar values, wrap in 1D array to maintain consistency
-                    # This is rare but can happen with certain model configurations
-                    logprobs = np.array([logprobs])
+                # Get log probability of the selected token
+                # logprobs shape is either [batch_size, vocab_size] or [vocab_size]
+                self.logger.debug(f"logprobs shape: {logprobs.shape}, token: {token}")
                 
-                # Track the maximum vocabulary size we've seen
-                # This is crucial because different tokens might have different
-                # vocabulary sizes due to model architecture or dynamic vocabulary
-                max_vocab_size = max(max_vocab_size, len(logprobs))
+                # Extract the log probability for the selected token
+                # Handle both batched and unbatched shapes
+                if len(logprobs.shape) == 2:
+                    # Remove batch dimension if present (shape: [1, vocab_size])
+                    logprobs = logprobs.squeeze(0)  # Now shape: [vocab_size]
+                # Now logprobs is always [vocab_size]
+                selected_logprob = logprobs[token]
+                # Convert to Python scalar
+                if isinstance(selected_logprob, mx.array):
+                    selected_logprob = selected_logprob.item()
+                token_logprobs.append(selected_logprob)
                 
-                # Store the standardized 1D logprobs
-                all_logprobs.append(logprobs)
+                # Debug logging
+                self.logger.debug(
+                    f"Token: {token_text!r}, "
+                    f"LogProb: {selected_logprob:.4f}, "
+                    f"Prob: {np.exp(selected_logprob):.4f}"
+                )
                 
                 # Stop if we hit the end token
                 if token == eos_token_id:
@@ -309,32 +306,20 @@ class MLXPatchFinder(PatchFinder):
             # Combine text from all generated tokens
             text = "".join(generated_text)
             
-            # Handle padding and truncation of log probabilities
-            # This is necessary because:
-            # 1. Different tokens might have different vocabulary sizes
-            # 2. We need consistent shapes for numpy.stack
-            # 3. We want to preserve probability mass distribution
-            if all_logprobs:
-                padded_logprobs = []
-                for logprob in all_logprobs:
-                    if len(logprob) < max_vocab_size:
-                        # If this token's logprobs are shorter than our maximum:
-                        # 1. Create padding array of very negative values (-1e10)
-                        # 2. When converted to probabilities, these will be effectively zero
-                        # 3. This preserves the probability mass of the original distribution
-                        padding = np.full(max_vocab_size - len(logprob), -1e10)
-                        padded_logprobs.append(np.concatenate([logprob, padding]))
-                    else:
-                        # If this token's logprobs are longer:
-                        # 1. Truncate to maximum size
-                        # 2. This might lose some probability mass
-                        # 3. But these are typically very low probability tokens
-                        padded_logprobs.append(logprob[:max_vocab_size])
+            # Convert token logprobs to numpy array
+            if token_logprobs:
+                # Shape: (sequence_length,)
+                logprobs = np.array(token_logprobs)
                 
-                # Stack all padded logprobs into a single 2D array
-                # Shape: (num_tokens, max_vocab_size)
-                logprobs = np.stack(padded_logprobs)
-                self.logger.debug(f"Generated logprobs shape after padding: {logprobs.shape}")
+                # Validation
+                probs = np.exp(logprobs)
+                self.logger.debug(
+                    f"Token probabilities - "
+                    f"Min: {probs.min():.4f}, "
+                    f"Max: {probs.max():.4f}, "
+                    f"Mean: {probs.mean():.4f}"
+                )
+                self.logger.debug(f"Sequence length: {len(logprobs)}")
             else:
                 self.logger.warning("No logprobs generated")
                 return None, None
@@ -509,6 +494,7 @@ class VLLMPatchFinder(PatchFinder):
             text = outputs[0].outputs[0].text
             logprobs = outputs[0].outputs[0].logprobs
             confidence = calculate_patch_confidence(logprobs)
+
             
             return text, confidence
             

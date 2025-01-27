@@ -22,7 +22,7 @@ def get_test_images():
     img_dir = os.path.join(os.path.dirname(script_dir), "tests", "img")
     return [
         os.path.join(img_dir, img)
-        for img in ["passport-1.jpeg", "passport2.jpg", "passport3.jpeg"]
+        for img in [ "usa.png", "germany.png", "passport3.jpeg"]
     ]
 
 def main():
@@ -55,11 +55,11 @@ def main():
             logger.info(f"\nProcessing image: {os.path.basename(img_path)}")
             
             # Process document with different confidence aggregation modes
-            for mode in ["max", "min", "average"]:
+            for mode in ["min", "max", "average"]:
                 logger.info(f"\nTesting with {mode} confidence aggregation:")
                 
                 # Format prompt using mlx-vlm's template
-                prompt = "Please analyze this passport image and extract all visible text and information. Include details like name, date of birth, passport number, and any other readable text."
+                prompt = "Extract all visible text and information from the image"
                 formatted_prompt = apply_chat_template(
                     processor, 
                     config, 
@@ -74,6 +74,7 @@ def main():
                     aggregation_mode=mode
                 )
                 
+                logger.info(f"Image: {os.path.basename(img_path)}")
                 logger.info(f"Extracted Text: {result['text']}")
                 logger.info(f"Confidence Score: {result['confidence']:.4f}")
                 logger.info(f"Processed Patches: {result['processed_patches']}")
@@ -102,7 +103,8 @@ def main():
                             formatted_prompt, 
                             image=[img_path], 
                             verbose=False,
-                            temperature=0.0
+                            temperature=0.0,
+                            max_tokens=1,
                         )
                 # Handle string or GenerationResult return type
                 output_text = result.text if hasattr(result, 'text') else str(result)
