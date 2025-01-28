@@ -8,7 +8,7 @@ from ..core import PatchFinder
 from ..confidence import calculate_patch_confidence
 
 class TransformersPatchFinder(PatchFinder):
-    """PatchFinder implementation for Hugging Face Transformers models."""
+    """PatchFinder implementation for Transformers models."""
     
     def __init__(
         self,
@@ -22,12 +22,35 @@ class TransformersPatchFinder(PatchFinder):
         super().__init__(patch_size, overlap, logger, max_workers)
         self.model = model
         self.processor = processor
-        self._configure_torch()
-
-    def _configure_torch(self):
-        torch.set_num_threads(self.max_workers)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        
+        # Validate model settings for confidence calculation
+        if self.model.generation_config.temperature != 0:
+            self.logger.warning("Setting temperature to 0 for confidence calculations")
+            self.model.generation_config.temperature = 0.0
+            
+        if self.model.generation_config.do_sample:
+            self.logger.warning("Disabling sampling for confidence analysis")
+            self.model.generation_config.do_sample = False
+            
+    def _get_vocab_size(self) -> Optional[int]:
+        """Extract vocabulary size from model configuration."""
+        try:
+            # Try model config first
+            if hasattr(self.model, 'config'):
+                vocab_size = getattr(self.model.config, 'vocab_size', None)
+                if vocab_size:
+                    return vocab_size
+                    
+            # Fallback to tokenizer vocab size
+            if hasattr(self.processor, 'tokenizer'):
+                vocab_size = len(self.processor.tokenizer)
+                if vocab_size > 0:
+                    return vocab_size
+                    
+            return None
+        except Exception as e:
+            self.logger.warning(f"Could not determine vocab size: {str(e)}")
+            return None
 
     def _process_patch(self, patch: Image, prompt: str, timeout: int, idx: int) -> Optional[Tuple[str, float]]:
         try:
@@ -55,12 +78,6 @@ class TransformersPatchFinder(PatchFinder):
             ).to(self.model.device)
 
             with torch.inference_mode():
-                if self.model.generation_config.temperature != 0:
-                    raise ValueError("Temperature must be 0 for confidence calculations")
-                
-                if self.model.generation_config.do_sample:
-                    raise ValueError("Sampling must be disabled for confidence analysis")
-
                 generate_ids = self.model.generate(
                     **inputs,
                     eos_token_id=self.processor.tokenizer.eos_token_id,
@@ -75,9 +92,19 @@ class TransformersPatchFinder(PatchFinder):
             generated_ids = generate_ids.sequences[0, inputs["input_ids"].shape[1]:]
             text = self.processor.decode(generated_ids, skip_special_tokens=True)
             
-            # Calculate confidence
+            # Get logits and convert to numpy
             logits = torch.stack(generate_ids.scores, dim=1).cpu().numpy()
-            confidence = calculate_patch_confidence(logits)
+            
+            # Get vocabulary size for proper normalization
+            vocab_size = self._get_vocab_size()
+            if vocab_size:
+                self.logger.debug(f"Using vocabulary size: {vocab_size}")
+            
+            # Calculate confidence with vocab size if available
+            confidence = calculate_patch_confidence(
+                logprobs=logits,
+                vocab_size=vocab_size
+            )
             
             return text, confidence
             

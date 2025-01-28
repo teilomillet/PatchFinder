@@ -9,6 +9,27 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing
 from PIL import Image
+import threading
+import contextlib
+
+@contextlib.contextmanager
+def managed_thread_pool(max_workers: int, logger: Optional[logging.Logger] = None):
+    """Context manager for thread pool that ensures proper cleanup."""
+    executor = ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="PatchFinder"
+    )
+    try:
+        yield executor
+    finally:
+        # Ensure proper shutdown sequence
+        executor.shutdown(wait=True, cancel_futures=True)
+        # Give threads time to clean up
+        for thread in threading.enumerate():
+            if thread.name.startswith("PatchFinder"):
+                thread.join(timeout=1.0)
+        if logger:
+            logger.debug("Thread pool cleaned up")
 
 class PatchFinder(ABC):
     """Base class for PatchFinder implementations supporting multiple backends."""
@@ -110,7 +131,7 @@ class PatchFinder(ABC):
         prompt: str = "Extract text",
         timeout: int = 30,
         aggregation_mode: Optional[str] = None,
-        max_workers: Optional[int] = None  # Number of parallel workers
+        max_workers: Optional[int] = None
     ) -> Dict:
         """Enhanced extraction with parallel processing and configurable confidence aggregation.
         
@@ -134,38 +155,54 @@ class PatchFinder(ABC):
                     "processed_patches": 0
                 }
 
-            # Default to number of CPU cores if max_workers not specified
+            # Use a more conservative thread count
             if max_workers is None:
-                max_workers = multiprocessing.cpu_count()
+                max_workers = min(
+                    self.max_workers or multiprocessing.cpu_count(),
+                    len(patches),
+                    8  # Cap at 8 threads to prevent resource issues
+                )
 
             results = []
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all patch processing tasks
-                future_to_patch = {
-                    executor.submit(self._process_patch, patch, prompt, timeout, idx): idx
-                    for idx, patch in enumerate(patches)
-                }
-                
-                # Collect results as they complete
-                for future in as_completed(future_to_patch):
-                    idx = future_to_patch[future]
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            text, confidence = result
-                            results.append((text, confidence))
-                            self.logger.debug(f"Patch {idx} completed with confidence {confidence:.4f}")
-                    except Exception as e:
-                        self.logger.error(f"Patch {idx} failed: {str(e)}")
-
-            # Use override mode if provided, else instance mode
-            mode = aggregation_mode.lower() if aggregation_mode else self.aggregation_mode
+            
+            # Use managed thread pool for automatic cleanup
+            with managed_thread_pool(max_workers, self.logger) as executor:
+                try:
+                    # Submit all patch processing tasks
+                    future_to_patch = {
+                        executor.submit(self._process_patch, patch, prompt, timeout, idx): idx
+                        for idx, patch in enumerate(patches)
+                    }
+                    
+                    # Collect results as they complete
+                    for future in as_completed(future_to_patch):
+                        idx = future_to_patch[future]
+                        try:
+                            result = future.result(timeout=timeout)
+                            if result is not None:
+                                text, confidence = result
+                                results.append((text, confidence))
+                                self.logger.debug(f"Patch {idx} completed with confidence {confidence:.4f}")
+                        except Exception as e:
+                            self.logger.error(f"Patch {idx} failed: {str(e)}")
+                            # Cancel remaining futures on error
+                            for f in future_to_patch:
+                                f.cancel()
+                except Exception as e:
+                    self.logger.error(f"Error during parallel processing: {str(e)}")
+                    # Ensure all futures are cancelled
+                    for future in future_to_patch.keys():
+                        future.cancel()
+                    raise
+            
+            # Use provided or instance aggregation mode
+            mode = aggregation_mode or self.aggregation_mode
             return self._compile_results(results, mode)
-        
+            
         except Exception as e:
-            self.logger.error(f"Processing failed: {str(e)}")
+            self.logger.error(f"Extraction failed: {str(e)}")
             return {
-                "text": "", 
+                "text": "",
                 "confidence": 0.0,
                 "processed_patches": 0
             }
