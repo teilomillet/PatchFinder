@@ -9,7 +9,6 @@ from mlx_vlm import load
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
 from patchfinder import PatchFinder
-from PIL import Image
 
 @dataclass
 class Config:

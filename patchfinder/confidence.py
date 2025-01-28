@@ -1,6 +1,6 @@
     # confidence.py 
 import numpy as np
-from scipy.special import logsumexp, softmax
+from scipy.special import logsumexp
 import logging
 
 logger = logging.getLogger(__name__)
